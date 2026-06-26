@@ -1,0 +1,20 @@
+{
+  "name": "gauss-explainer",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "render": "remotion render GaussVideo out/gauss.mp4 --codec=h264 --crf=18 --concurrency=2",
+    "studio": "remotion studio"
+  },
+  "dependencies": {
+    "@remotion/fonts": "4.0.418",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "remotion": "4.0.418"
+  },
+  "devDependencies": {
+    "@remotion/cli": "4.0.418",
+    "@types/react": "19.2.0",
+    "typescript": "5.7.3"
+  }
+}

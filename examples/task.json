@@ -1,0 +1,10 @@
+{
+  "kind": "image",
+  "title": "周末做了人生第一锅咖喱",
+  "content": "踩了三个坑才搞定，分享给同样手残的你～\n1. 咖喱块要关火后再下\n2. 土豆切大块才不会化\n3. 最后焖十分钟更入味",
+  "images": [
+    "/absolute/path/to/photo1.jpg",
+    "/absolute/path/to/photo2.jpg"
+  ],
+  "topics": ["美食", "家常菜", "新手下厨"]
+}

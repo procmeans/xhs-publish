@@ -1,0 +1,80 @@
+{
+  "fps": 30,
+  "width": 1080,
+  "height": 1440,
+  "audioSrc": "voiceover.wav",
+  "durationMs": 107166,
+  "durationFrames": 3215,
+  "scenes": [
+    {
+      "id": 1,
+      "visual": "img:gauss_classroom.png",
+      "captions": [
+        "两百多年前，老师想偷懒",
+        "“把 1 加到 100”",
+        "一个 10 岁小孩，几秒就报出答案",
+        "5050"
+      ],
+      "startMs": 0,
+      "endMs": 14327,
+      "startFrame": 0,
+      "endFrame": 430
+    },
+    {
+      "id": 2,
+      "visual": "anim:PairSum",
+      "captions": [
+        "1+100=101，2+99=101…",
+        "一共 50 对",
+        "50 × 101 = 5050",
+        "他叫高斯，后来的“数学王子”"
+      ],
+      "startMs": 14677,
+      "endMs": 36139,
+      "startFrame": 440,
+      "endFrame": 1084
+    },
+    {
+      "id": 3,
+      "visual": "img:gauss_portrait.png",
+      "captions": [
+        "高斯 1777—1855",
+        "数论 / 几何 / 天文 / 物理",
+        "不到 20 岁",
+        "尺规作出正 17 边形（2000 年难题）"
+      ],
+      "startMs": 36489,
+      "endMs": 58474,
+      "startFrame": 1095,
+      "endFrame": 1754
+    },
+    {
+      "id": 4,
+      "visual": "anim:BellCurve",
+      "captions": [
+        "正态分布 = 高斯分布",
+        "身高 / 成绩 / 误差 都像它",
+        "约 68% 落在 ±1σ 内",
+        "曾印在德国马克纸币上"
+      ],
+      "startMs": 58824,
+      "endMs": 81072,
+      "startFrame": 1765,
+      "endFrame": 2432
+    },
+    {
+      "id": 5,
+      "visual": "img:ceres_night.png",
+      "captions": [
+        "1801 年，谷神星失踪",
+        "高斯算出它会在哪里重现 → 真的找到了",
+        "“数学是科学的女王”",
+        "关注我，看更多数学家的故事"
+      ],
+      "startMs": 81422,
+      "endMs": 108566,
+      "startFrame": 2443,
+      "endFrame": 3257
+    }
+  ]
+}
