@@ -134,3 +134,84 @@ internal/publisher/human.go      拟人化：停顿 / 鼠标轨迹 / 变速打�
 scripts/start-chrome.sh          启动可调试 Chrome
 examples/task.json               示例任务
 ```
+
+---
+
+# English
+
+**xhs-publish** auto-posts image and video notes to Xiaohongshu (RED) by reusing
+a login you do **once**. Following the "Playwright MCP auto-publish" approach, it
+never scripts the login (which triggers captchas); instead it attaches over the
+Chrome DevTools Protocol to a browser you already logged into.
+
+## How it works
+
+```
+You start Chrome with a debug port ──scan-login once──> keep it running
+                                                          │
+xhspublish ──ConnectOverCDP(:9222)──────────────────────> reuse that session
+                                                          │
+        creator center → upload media → fill title/body/topics → click 发布
+```
+
+It always drives your **real, visible Chrome — never headless**. On start it
+prints `attaching to real Chrome ... (not headless)`.
+
+## Install
+
+```bash
+go build -o bin/xhspublish ./cmd/xhspublish
+# First run installs the Playwright driver (no browser download — we attach your Chrome):
+go run github.com/playwright-community/playwright-go/cmd/playwright@latest install --no-shell || true
+```
+
+## Usage
+
+```bash
+# 1. start Chrome and log into Xiaohongshu once; keep the window open
+./scripts/start-chrome.sh
+
+# 2. write a task JSON (see examples/task.json):
+#    {"kind":"image","title":"...","content":"...","images":["/abs/1.jpg"],"topics":["food"]}
+#    video note: {"kind":"video","video":"/abs/final.mp4", ...}
+
+# 3. dry-run (default): fills the form but does NOT click 发布
+./bin/xhspublish -task examples/task.json
+
+# 4. publish for real
+./bin/xhspublish -task examples/task.json -publish
+```
+
+### Flags
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-task` | (required) | path to the task JSON |
+| `-cdp` | `http://localhost:9222` | Chrome debug endpoint |
+| `-publish` | `false` | actually click 发布 (otherwise fill only) |
+| `-no-human` | `false` | disable human-like behavior (faster) |
+| `-timeout` | `60s` | per-step timeout |
+
+## Human-like behavior (on by default)
+
+So the run doesn't look like a metronome (all in `internal/publisher/human.go`,
+disable with `-no-human`): randomized think-pauses, quadratic-Bézier mouse paths
+(ease-in-out + jitter), hover-before-click with a randomized landing point,
+variable-speed typing, occasional typos that get backspaced and fixed, and a
+chance to clear and retype the title. This makes filling a note take ~2 minutes,
+by design.
+
+## Notes
+
+- **Publish button**: it's an `xhs-publish-btn` custom element with a *closed*
+  shadow root — its "发布" label is invisible to text/role/CSS selectors and the
+  red is a gradient. `clickPublish` polls the host's `submit-disabled` attribute
+  (waits for video transcoding) then clicks the right-hand 发布 pill by position.
+  Use `cmd/xhsdebug` to re-locate elements if the DOM changes.
+- **Cover**: the cover editor opens a native file dialog and is awkward to drive,
+  so the reliable path is baking your cover as the video's first frame (ffmpeg
+  snippet above) — Xiaohongshu's default "first frame" then uses it.
+- **Limits**: title ≤20 chars, body ≤1000, 1–18 images — enforced in `Validate()`.
+- **Compliance**: follow Xiaohongshu's rules, throttle frequency, avoid banned
+  marketing terms. Automated posting is at your own account's risk.
+- Closing `xhspublish` only detaches CDP; it does **not** close your Chrome.
