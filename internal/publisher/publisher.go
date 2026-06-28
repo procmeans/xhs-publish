@@ -198,6 +198,17 @@ func (p *Publisher) Publish(t *task.PublishTask) error {
 		return err
 	}
 
+	// Custom cover: upload a dedicated cover image rather than letting 小红书
+	// default to a video frame. Best-effort — a missing cover control must not
+	// block the publish.
+	if t.Kind == task.KindVideo && t.Cover != "" {
+		if err := p.setCover(t.Cover); err != nil {
+			log.Printf("note: set custom cover failed (%v); 小红书 will fall back to a video frame", err)
+		} else {
+			log.Printf("custom cover set: %s", t.Cover)
+		}
+	}
+
 	if p.opt.DryRun {
 		log.Println("[dry-run] form filled; NOT clicking 发布. Review the browser, then re-run with --publish.")
 		return nil
@@ -297,6 +308,123 @@ func (p *Publisher) cdpSetInputFiles(files []string) error {
 		"objectId": objectID,
 	}); err != nil {
 		return fmt.Errorf("DOM.setFileInputFiles: %w", err)
+	}
+	return nil
+}
+
+// setCover uploads a dedicated cover image for a video note. The flow mirrors a
+// human's: 小红书 defaults to a video frame and only mounts the cover image
+// <input type=file> inside an editor modal. So we (1) click the "修改封面" entry
+// to open the cover editor (it appears only after recommended covers finish
+// loading), (2) push the image onto the modal's image input via raw CDP
+// DOM.setFileInputFiles (no 50MB cap, no native file dialog), (3) click 确定.
+// Best-effort: any step failing returns an error and the caller keeps the
+// default video-frame cover.
+func (p *Publisher) setCover(path string) error {
+	const imgInputSel = `input[type=file][accept*="image"]`
+
+	// 1. Open the cover editor. The "修改封面" entry (.operator.noCover.pointer)
+	//    only exists once recommended covers load, so poll for up to ~30s.
+	openJS := `(() => {
+		if (document.querySelector('.cover-modal ` + `input[type=file][accept*="image"]` + `')) return true;
+		const e = document.querySelector('.cover-plugin-preview .operator.noCover.pointer')
+			|| Array.from(document.querySelectorAll('div')).find(x => { const c=(x.className||'').toString(); return c.includes('noCover') && c.includes('pointer'); })
+			|| Array.from(document.querySelectorAll('div,span')).find(x => (x.innerText||'').trim() === '修改封面');
+		if (e) { e.click(); }
+		return false;
+	})()`
+	opened := false
+	for i := 0; i < 30; i++ {
+		if p.domHas(`.cover-modal ` + imgInputSel) {
+			opened = true
+			break
+		}
+		_, _ = p.page.Evaluate(openJS)
+		p.page.WaitForTimeout(1000)
+	}
+	if !opened {
+		return fmt.Errorf("cover editor did not open (recommended covers may still be loading)")
+	}
+
+	// 2. Push the image onto the modal's image input via CDP.
+	if err := p.cdpSetCoverFile(path); err != nil {
+		return err
+	}
+
+	// 3. The upload lands in the editor's image strip as a blob thumbnail;
+	//    click it so it becomes the active cover on the canvas.
+	p.page.WaitForTimeout(2500)
+	selectJS := `(() => {
+		const m = document.querySelector('.cover-modal'); if (!m) return false;
+		const img = Array.from(m.querySelectorAll('img')).find(e => (e.src||'').startsWith('blob:'));
+		if (!img) return false;
+		(img.closest('[class]') || img).click();
+		img.click();
+		return true;
+	})()`
+	if v, _ := p.page.Evaluate(selectJS); v != true {
+		return fmt.Errorf("uploaded cover thumbnail not found to select")
+	}
+
+	// 4. Confirm (确定) to apply the cover to the note.
+	p.page.WaitForTimeout(1500)
+	confirmJS := `(() => {
+		const m = document.querySelector('.cover-modal'); if (!m) return false;
+		const btn = Array.from(m.querySelectorAll('button')).find(b => (b.innerText||'').trim() === '确定');
+		if (!btn) return false; btn.click(); return true;
+	})()`
+	v, err := p.page.Evaluate(confirmJS)
+	if b, ok := v.(bool); err != nil || !ok || !b {
+		return fmt.Errorf("cover confirm (确定) not clicked (err=%v)", err)
+	}
+	p.page.WaitForTimeout(2000)
+	return nil
+}
+
+// domHas reports whether the page currently has an element matching sel.
+func (p *Publisher) domHas(sel string) bool {
+	v, err := p.page.Evaluate(`(s) => !!document.querySelector(s)`, sel)
+	if err != nil {
+		return false
+	}
+	b, _ := v.(bool)
+	return b
+}
+
+// cdpSetCoverFile sets the cover image onto the modal's image-accepting
+// <input type=file> via raw CDP DOM.setFileInputFiles. The cover editor modal
+// must already be open (see setCover).
+func (p *Publisher) cdpSetCoverFile(path string) error {
+	sess, err := p.page.Context().NewCDPSession(p.page)
+	if err != nil {
+		return fmt.Errorf("new cdp session: %w", err)
+	}
+	defer sess.Detach()
+
+	if _, err := sess.Send("DOM.enable", nil); err != nil {
+		return fmt.Errorf("DOM.enable: %w", err)
+	}
+	// Prefer the image input inside the cover modal; fall back to any image one.
+	res, err := sess.Send("Runtime.evaluate", map[string]interface{}{
+		"expression": `(() => {
+			const inModal = document.querySelector('.cover-modal input[type=file][accept*="image"]');
+			if (inModal) return inModal;
+			const xs = Array.from(document.querySelectorAll('input[type=file]'));
+			return xs.find(e => ((e.getAttribute('accept') || '').toLowerCase().includes('image'))) || null;
+		})()`,
+	})
+	if err != nil {
+		return fmt.Errorf("locate cover input via cdp: %w", err)
+	}
+	objectID, err := evalObjectID(res)
+	if err != nil {
+		return fmt.Errorf("cover image <input type=file> not found in modal: %w", err)
+	}
+	if _, err := sess.Send("DOM.setFileInputFiles", map[string]interface{}{
+		"files":    []string{path},
+		"objectId": objectID,
+	}); err != nil {
+		return fmt.Errorf("DOM.setFileInputFiles(cover): %w", err)
 	}
 	return nil
 }
