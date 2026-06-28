@@ -25,7 +25,46 @@ type Options struct {
 	DryRun      bool          // fill everything but do NOT click 发布
 	Headful     bool          // unused for CDP attach; kept for clarity
 	Humanize    bool          // add human-like pauses/mouse paths/typos
+	Human       HumanProfile  // tunes HOW human the behavior is (when Humanize)
 	StepTimeout time.Duration // per-action timeout
+}
+
+// HumanProfile tunes the humanization behavior. All factors are multipliers
+// around the built-in baseline (1.0 = the hand-tuned default); a zero value for
+// any field falls back to its default via withDefaults, so a manually built
+// Options{Humanize: true} still behaves sensibly.
+type HumanProfile struct {
+	TypoRate    float64 // chance of fumbling a character (0 disables typos)
+	SpeedFactor float64 // typing speed multiplier; >1 faster, <1 slower
+	Caution     float64 // multiplier on "thinking" pauses & hesitation
+	Fatigue     bool    // warm up then slow down over long passages
+}
+
+// DefaultHumanProfile is the hand-tuned baseline behavior.
+func DefaultHumanProfile() HumanProfile {
+	return HumanProfile{
+		TypoRate:    0.05,
+		SpeedFactor: 1.0,
+		Caution:     1.0,
+		Fatigue:     true,
+	}
+}
+
+// withDefaults replaces non-positive factors with their baseline so partially
+// filled profiles (and the zero value) stay usable. TypoRate is left as-is so
+// callers can deliberately set it to 0 to disable typos.
+func (h HumanProfile) withDefaults() HumanProfile {
+	d := DefaultHumanProfile()
+	if h.SpeedFactor <= 0 {
+		h.SpeedFactor = d.SpeedFactor
+	}
+	if h.Caution <= 0 {
+		h.Caution = d.Caution
+	}
+	if h.TypoRate < 0 {
+		h.TypoRate = 0
+	}
+	return h
 }
 
 // DefaultOptions returns sane defaults.
@@ -34,6 +73,7 @@ func DefaultOptions() Options {
 		CDPEndpoint: "http://localhost:9222",
 		DryRun:      true,
 		Humanize:    true,
+		Human:       DefaultHumanProfile(),
 		StepTimeout: 60 * time.Second,
 	}
 }
@@ -45,9 +85,10 @@ type Publisher struct {
 	page    playwright.Page
 	opt     Options
 
-	human        bool       // humanization on
-	rng          *rand.Rand // randomness for pauses/jitter/typos
-	lastX, lastY float64    // tracked cursor position for mouse paths
+	human        bool         // humanization on
+	profile      HumanProfile // tunables for the humanization behavior
+	rng          *rand.Rand   // randomness for pauses/jitter/typos
+	lastX, lastY float64      // tracked cursor position for mouse paths
 }
 
 // New attaches to the Chrome instance exposed on opt.CDPEndpoint.
@@ -95,10 +136,14 @@ func New(opt Options) (*Publisher, error) {
 		page:    page,
 		opt:     opt,
 		human:   opt.Humanize,
+		profile: opt.Human.withDefaults(),
 		// Seed from wall-clock so each run's noise differs.
 		rng:   rand.New(rand.NewSource(time.Now().UnixNano())),
 		lastX: 660 + float64(rand.Intn(120)),
 		lastY: 360 + float64(rand.Intn(120)),
+	}
+	if p.human {
+		p.HardenStealth() // mask navigator.webdriver before we touch the site
 	}
 	return p, nil
 }
@@ -182,10 +227,28 @@ func (p *Publisher) selectTab(kind task.Kind) error {
 
 // uploadMedia feeds files to the hidden <input type=file> and waits for the
 // uploads to settle.
+//
+// We set the files via a raw CDP DOM.setFileInputFiles call rather than
+// Playwright's SetInputFiles. SetInputFiles streams the file bytes over the CDP
+// wire, which the protocol caps at 50MB when attached over CDP (ConnectOverCDP)
+// — far too small for an HD video that can be hundreds of MB or a GB. CDP's
+// DOM.setFileInputFiles instead hands the browser a local filesystem path it
+// reads itself, so there is no size limit (the browser is co-located with the
+// files). Playwright's SetInputFiles remains a fallback if CDP resolution fails.
 func (p *Publisher) uploadMedia(kind task.Kind, files []string) error {
 	input := p.page.Locator(`input[type="file"]`).First()
-	if err := input.SetInputFiles(files); err != nil {
-		return fmt.Errorf("set input files: %w", err)
+	// Ensure the input exists in the DOM before resolving it over CDP.
+	if err := input.WaitFor(playwright.LocatorWaitForOptions{
+		State:   playwright.WaitForSelectorStateAttached,
+		Timeout: ms(p.opt.StepTimeout),
+	}); err != nil {
+		return fmt.Errorf("file input not found: %w", err)
+	}
+	if err := p.cdpSetInputFiles(files); err != nil {
+		log.Printf("note: CDP upload failed (%v); falling back to Playwright SetInputFiles (50MB cap)", err)
+		if err := input.SetInputFiles(files); err != nil {
+			return fmt.Errorf("set input files: %w", err)
+		}
 	}
 	log.Printf("uploaded %d file(s); waiting for processing...", len(files))
 
@@ -203,6 +266,56 @@ func (p *Publisher) uploadMedia(kind task.Kind, files []string) error {
 		p.page.WaitForTimeout(3000)
 	}
 	return nil
+}
+
+// cdpSetInputFiles sets file paths on the first <input type=file> via raw CDP
+// (DOM.setFileInputFiles), which reads files from local disk with no size limit
+// — unlike Playwright's SetInputFiles over CDP, which is capped at 50MB.
+func (p *Publisher) cdpSetInputFiles(files []string) error {
+	sess, err := p.page.Context().NewCDPSession(p.page)
+	if err != nil {
+		return fmt.Errorf("new cdp session: %w", err)
+	}
+	defer sess.Detach()
+
+	if _, err := sess.Send("DOM.enable", nil); err != nil {
+		return fmt.Errorf("DOM.enable: %w", err)
+	}
+	// Resolve the file input element to a CDP remote object id.
+	res, err := sess.Send("Runtime.evaluate", map[string]interface{}{
+		"expression": `document.querySelector('input[type=file]')`,
+	})
+	if err != nil {
+		return fmt.Errorf("locate input via cdp: %w", err)
+	}
+	objectID, err := evalObjectID(res)
+	if err != nil {
+		return err
+	}
+	if _, err := sess.Send("DOM.setFileInputFiles", map[string]interface{}{
+		"files":    files,
+		"objectId": objectID,
+	}); err != nil {
+		return fmt.Errorf("DOM.setFileInputFiles: %w", err)
+	}
+	return nil
+}
+
+// evalObjectID extracts result.objectId from a Runtime.evaluate CDP response.
+func evalObjectID(res interface{}) (string, error) {
+	m, ok := res.(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("unexpected cdp response type %T", res)
+	}
+	result, ok := m["result"].(map[string]interface{})
+	if !ok {
+		return "", fmt.Errorf("cdp evaluate: missing result object")
+	}
+	objectID, ok := result["objectId"].(string)
+	if !ok || objectID == "" {
+		return "", fmt.Errorf("cdp evaluate: file input not present in DOM")
+	}
+	return objectID, nil
 }
 
 func (p *Publisher) fillTitle(title string) error {
@@ -280,6 +393,7 @@ func (p *Publisher) clickPublish() error {
 	// 暂存离开 sits on the left of the component, 发布 on the right (~0.61 across).
 	cx := box.X + box.Width*0.61 + p.jitter(box.Width*0.03)
 	cy := box.Y + box.Height*0.5 + p.jitter(box.Height*0.18)
+	p.readPage()       // skim the finished post before committing
 	p.pause(500, 1400) // a beat of hesitation before committing
 	if err := p.humanClickXY(cx, cy); err != nil {
 		return fmt.Errorf("click 发布: %w", err)
