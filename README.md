@@ -119,6 +119,7 @@ go run github.com/playwright-community/playwright-go/cmd/playwright@latest insta
 
 - **平台限制**：标题 ≤20 字、正文 ≤1000 字、图文 1–18 张，已在 `Validate()` 中校验。
 - **页面 DOM 会变**：选择器集中在 `internal/publisher/publisher.go`，小红书改版时改这里。
+- **大文件上传**：媒体通过原生 CDP `DOM.setFileInputFiles`（浏览器本地读盘）上传，**无 50MB 限制**，高清/GB 级视频可直接发；Playwright `SetInputFiles`（CDP 线传，封顶 50MB）仅作兜底。
 - **合规**：自动化发布需遵守小红书平台规则，控制频率、避免营销违规词（可配合
   `rainwell-creative-editing` 的 content lint），账号风险自负。
 - `xhspublish` 关闭时只断开 CDP 连接，**不会**关掉你的 Chrome。
