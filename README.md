@@ -74,10 +74,35 @@ go run github.com/playwright-community/playwright-go/cmd/playwright@latest insta
 | 参数 | 默认 | 说明 |
 |------|------|------|
 | `-task` | （必填） | task JSON 路径 |
+| `-platform` | `xhs` | 目标平台：`xhs`（小红书）或 `douyin`（抖音） |
 | `-cdp` | `http://localhost:9222` | Chrome 调试端口 |
 | `-publish` | `false` | 真正点「发布」；不加则只填表（安全默认） |
 | `-no-human` | `false` | 关闭拟人化（更快，但更像机器） |
 | `-timeout` | `60s` | 单步超时 |
+
+## 抖音（Douyin）
+
+同一套 Go + CDP 框架已支持抖音创作中心（`creator.douyin.com`，目前**仅视频**）。
+公共内核（CDP attach、拟人化、上传）共用，平台差异收敛在
+`internal/publisher/{xhs,douyin}.go` 两个 `Platform` 实现里。
+
+```bash
+# 1. start-chrome.sh 现在会同时打开小红书 + 抖音登录页，两个都扫码登录一次
+./scripts/start-chrome.sh
+
+# 2. dry-run（默认，只填表不发布）
+./bin/xhspublish -platform douyin -task examples/task_douyin.json
+
+# 3. 确认无误后真正发布
+./bin/xhspublish -platform douyin -task examples/task_douyin.json -publish
+```
+
+抖音与小红书共用同一个 `PublishTask` 契约（`kind/title/content/video/cover/topics`），
+仅标题上限不同（抖音 ≤30 字，小红书 ≤20 字，按 `-platform` 自动选择）。
+
+> **选择器需实测**：抖音创作中心改版频繁，`douyin.go` 的封面 / 发布按钮选择器以
+> 文案匹配为主、结构选择器兜底，属 best-effort。封面失败不阻断发布（回退首帧）。
+> DOM 漂移时用 `cmd/xhsdebug`（已支持抖音上传页，dump 含标题输入 + 发布按钮候选）重新定位。
 
 ## 拟人化（默认开启）
 
@@ -117,8 +142,8 @@ go run github.com/playwright-community/playwright-go/cmd/playwright@latest insta
 
 ## 注意事项
 
-- **平台限制**：标题 ≤20 字、正文 ≤1000 字、图文 1–18 张，已在 `Validate()` 中校验。
-- **页面 DOM 会变**：选择器集中在 `internal/publisher/publisher.go`，小红书改版时改这里。
+- **平台限制**：标题 ≤20 字（抖音 ≤30）、正文 ≤1000 字、图文 1–18 张，已在 `ValidateWith()` 中按平台校验。
+- **页面 DOM 会变**：公共流程在 `internal/publisher/publisher.go`，各平台选择器分别在 `xhs.go` / `douyin.go`，改版时改对应文件。
 - **大文件上传**：媒体通过原生 CDP `DOM.setFileInputFiles`（浏览器本地读盘）上传，**无 50MB 限制**，高清/GB 级视频可直接发；Playwright `SetInputFiles`（CDP 线传，封顶 50MB）仅作兜底。
 - **合规**：自动化发布需遵守小红书平台规则，控制频率、避免营销违规词（可配合
   `rainwell-creative-editing` 的 content lint），账号风险自负。
@@ -127,13 +152,16 @@ go run github.com/playwright-community/playwright-go/cmd/playwright@latest insta
 ## 结构
 
 ```
-cmd/xhspublish/main.go           CLI 入口
-cmd/xhsdebug/main.go             元素定位调试工具（DOM 改版时复用）
-internal/task/task.go            PublishTask 模型 + 校验（数据契约）
-internal/publisher/publisher.go  Playwright/CDP 发布流程（含 xhs-publish-btn 破解）
+cmd/xhspublish/main.go           CLI 入口（-platform xhs|douyin）
+cmd/xhsdebug/main.go             元素定位调试工具（DOM 改版时复用，含抖音）
+internal/task/task.go            PublishTask 模型 + 按平台校验（数据契约）
+internal/publisher/publisher.go  公共内核：CDP attach / 上传 / Platform 接口编排
+internal/publisher/xhs.go        小红书 Platform 实现（含 xhs-publish-btn 破解）
+internal/publisher/douyin.go     抖音 Platform 实现（视频，best-effort 选择器）
 internal/publisher/human.go      拟人化：停顿 / 鼠标轨迹 / 变速打字 / 错别字
-scripts/start-chrome.sh          启动可调试 Chrome
-examples/task.json               示例任务
+scripts/start-chrome.sh          启动可调试 Chrome（同开小红书 + 抖音登录页）
+examples/task.json               小红书示例任务
+examples/task_douyin.json        抖音示例任务
 ```
 
 ---

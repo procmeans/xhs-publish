@@ -25,6 +25,7 @@ func main() {
 
 	var (
 		taskPath  = flag.String("task", "", "path to the publish task JSON file (required)")
+		platform  = flag.String("platform", "xhs", `target platform: "xhs" (小红书) or "douyin" (抖音)`)
 		cdp       = flag.String("cdp", "http://localhost:9222", "Chrome DevTools Protocol endpoint")
 		publish   = flag.Bool("publish", false, "actually click 发布 (default is dry-run: fill only)")
 		noHuman   = flag.Bool("no-human", false, "disable human-like pauses/mouse paths/typos (faster)")
@@ -42,13 +43,14 @@ func main() {
 		os.Exit(2)
 	}
 
-	t, err := task.Load(*taskPath)
+	t, err := task.LoadFor(*taskPath, *platform)
 	if err != nil {
 		log.Fatalf("invalid task: %v", err)
 	}
-	log.Printf("task: kind=%s title=%q topics=%v", t.Kind, t.Title, t.NormalizedTopics())
+	log.Printf("platform=%s task: kind=%s title=%q topics=%v", *platform, t.Kind, t.Title, t.NormalizedTopics())
 
 	opt := publisher.DefaultOptions()
+	opt.Platform = *platform
 	opt.CDPEndpoint = *cdp
 	opt.DryRun = !*publish
 	opt.Humanize = !*noHuman

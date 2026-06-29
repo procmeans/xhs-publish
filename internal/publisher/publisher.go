@@ -1,9 +1,16 @@
-// Package publisher drives the Xiaohongshu creator web UI via Playwright.
+// Package publisher drives a creator web UI (Xiaohongshu, Douyin, …) via
+// Playwright.
 //
 // The approach mirrors the "Playwright MCP 小红书全自动发布" guide: instead of
 // scripting the login (which triggers captchas), we attach over the Chrome
 // DevTools Protocol to a browser the user already logged into once, and reuse
 // that session for every publish.
+//
+// Everything that is the SAME across platforms — attaching over CDP, the
+// human-like interaction layer (human.go), uploading media with no size cap —
+// lives on *Publisher. Everything that DIFFERS per site — which URL to open,
+// how to tell "logged out", the title/body selectors, the cover editor, the
+// publish button — lives behind the Platform interface (see xhs.go, douyin.go).
 package publisher
 
 import (
@@ -17,10 +24,55 @@ import (
 	"github.com/procmeans/xhs-publish/internal/task"
 )
 
-const publishURL = "https://creator.xiaohongshu.com/publish/publish"
+// Platform is one publishing site's page-flow: the steps that differ between
+// Xiaohongshu, Douyin, and any future target. Each method receives the shared
+// *Publisher so it can reuse the human-like helpers (humanType, humanClick…)
+// and the CDP plumbing.
+type Platform interface {
+	// Name is the human-readable platform name (used in log/error messages).
+	Name() string
+	// Host is the creator-center hostname; used to pick this platform's tab out
+	// of an already-open multi-tab Chrome so we never hijack another site's tab.
+	Host() string
+	// PublishURL is the page to open to start composing a note of this kind.
+	PublishURL(kind task.Kind) string
+	// LoggedOut reports whether the current URL means "not authenticated"
+	// (i.e. we got bounced to a login/passport page).
+	LoggedOut(currentURL string) bool
+	// SelectTab switches the composer to the image/video mode (may be a no-op
+	// on sites whose upload page is already kind-specific).
+	SelectTab(p *Publisher, kind task.Kind) error
+	// ReadyLocator becomes visible only once media upload/processing finishes;
+	// the orchestrator waits on it to ride out video transcoding. Usually the
+	// title field.
+	ReadyLocator(p *Publisher) playwright.Locator
+	// FillTitle types the note title.
+	FillTitle(p *Publisher, title string) error
+	// FillContent types the body and hashtags.
+	FillContent(p *Publisher, t *task.PublishTask) error
+	// SetCover uploads a dedicated cover image (best-effort; a returned error is
+	// logged and the platform's default frame is kept).
+	SetCover(p *Publisher, coverPath string) error
+	// ClickPublish commits the post.
+	ClickPublish(p *Publisher) error
+}
+
+// platformFor maps a platform key to its implementation. An empty key defaults
+// to Xiaohongshu so existing task files / commands keep working unchanged.
+func platformFor(name string) (Platform, error) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", "xhs", "xiaohongshu", "小红书":
+		return xhsSite{}, nil
+	case "douyin", "dy", "抖音":
+		return douyinSite{}, nil
+	default:
+		return nil, fmt.Errorf("unknown platform %q (want %q or %q)", name, "xhs", "douyin")
+	}
+}
 
 // Options configures a publish run.
 type Options struct {
+	Platform    string        // "xhs" (default) or "douyin"
 	CDPEndpoint string        // e.g. http://localhost:9222
 	DryRun      bool          // fill everything but do NOT click 发布
 	Headful     bool          // unused for CDP attach; kept for clarity
@@ -70,6 +122,7 @@ func (h HumanProfile) withDefaults() HumanProfile {
 // DefaultOptions returns sane defaults.
 func DefaultOptions() Options {
 	return Options{
+		Platform:    "xhs",
 		CDPEndpoint: "http://localhost:9222",
 		DryRun:      true,
 		Humanize:    true,
@@ -78,12 +131,14 @@ func DefaultOptions() Options {
 	}
 }
 
-// Publisher owns a Playwright connection to an already-running Chrome.
+// Publisher owns a Playwright connection to an already-running Chrome and a
+// chosen Platform whose page-flow it drives.
 type Publisher struct {
 	pw      *playwright.Playwright
 	browser playwright.Browser
 	page    playwright.Page
 	opt     Options
+	site    Platform
 
 	human        bool         // humanization on
 	profile      HumanProfile // tunables for the humanization behavior
@@ -97,8 +152,12 @@ type Publisher struct {
 //
 //	google-chrome --remote-debugging-port=9222 --user-data-dir=/path/to/profile
 //
-// and log into Xiaohongshu once in it.
+// and log into the target platform once in it.
 func New(opt Options) (*Publisher, error) {
+	site, err := platformFor(opt.Platform)
+	if err != nil {
+		return nil, err
+	}
 	pw, err := playwright.Run()
 	if err != nil {
 		return nil, fmt.Errorf("start playwright driver: %w", err)
@@ -118,11 +177,17 @@ func New(opt Options) (*Publisher, error) {
 	ctx := browser.Contexts()[0]
 	ctx.SetDefaultTimeout(float64(opt.StepTimeout.Milliseconds()))
 
-	// Reuse an existing tab if present, otherwise open one.
+	// Pick THIS platform's tab so we never hijack another site's tab (e.g. an
+	// in-progress 小红书 note) when several creator tabs are open. Prefer a tab
+	// already on the platform host; otherwise open a fresh tab for our work.
 	var page playwright.Page
-	if pages := ctx.Pages(); len(pages) > 0 {
-		page = pages[0]
-	} else {
+	for _, pg := range ctx.Pages() {
+		if strings.Contains(pg.URL(), site.Host()) {
+			page = pg
+			break
+		}
+	}
+	if page == nil {
 		if page, err = ctx.NewPage(); err != nil {
 			browser.Close()
 			pw.Stop()
@@ -135,6 +200,7 @@ func New(opt Options) (*Publisher, error) {
 		browser: browser,
 		page:    page,
 		opt:     opt,
+		site:    site,
 		human:   opt.Humanize,
 		profile: opt.Human.withDefaults(),
 		// Seed from wall-clock so each run's noise differs.
@@ -158,28 +224,28 @@ func (p *Publisher) Close() {
 	}
 }
 
-// EnsureLoggedIn verifies the attached session is authenticated.
-func (p *Publisher) EnsureLoggedIn() error {
-	if _, err := p.page.Goto(publishURL, playwright.PageGotoOptions{
+// ensureLoggedIn navigates to the platform's compose page and verifies the
+// attached session is authenticated.
+func (p *Publisher) ensureLoggedIn(kind task.Kind) error {
+	url := p.site.PublishURL(kind)
+	if _, err := p.page.Goto(url, playwright.PageGotoOptions{
 		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
 	}); err != nil {
-		return fmt.Errorf("navigate to creator center: %w", err)
+		return fmt.Errorf("navigate to %s creator center: %w", p.site.Name(), err)
 	}
-	// Logged out → redirected to a login page.
-	if u := p.page.URL(); strings.Contains(u, "login") {
-		return fmt.Errorf("session is not logged in (landed on %s). "+
-			"Log into Xiaohongshu in the attached Chrome, then retry", u)
+	if u := p.page.URL(); p.site.LoggedOut(u) {
+		return fmt.Errorf("%s session is not logged in (landed on %s). "+
+			"Log into %s in the attached Chrome, then retry", p.site.Name(), u, p.site.Name())
 	}
 	return nil
 }
 
-// Publish runs the full flow for one task.
+// Publish runs the full flow for one task against the configured platform.
 func (p *Publisher) Publish(t *task.PublishTask) error {
-	if err := p.EnsureLoggedIn(); err != nil {
+	if err := p.ensureLoggedIn(t.Kind); err != nil {
 		return err
 	}
-
-	if err := p.selectTab(t.Kind); err != nil {
+	if err := p.site.SelectTab(p, t.Kind); err != nil {
 		return err
 	}
 
@@ -191,19 +257,19 @@ func (p *Publisher) Publish(t *task.PublishTask) error {
 		return err
 	}
 
-	if err := p.fillTitle(t.Title); err != nil {
+	if err := p.site.FillTitle(p, t.Title); err != nil {
 		return err
 	}
-	if err := p.fillContent(t); err != nil {
+	if err := p.site.FillContent(p, t); err != nil {
 		return err
 	}
 
-	// Custom cover: upload a dedicated cover image rather than letting 小红书
-	// default to a video frame. Best-effort — a missing cover control must not
-	// block the publish.
+	// Custom cover: upload a dedicated cover image rather than letting the
+	// platform default to a video frame. Best-effort — a missing cover control
+	// must not block the publish.
 	if t.Kind == task.KindVideo && t.Cover != "" {
-		if err := p.setCover(t.Cover); err != nil {
-			log.Printf("note: set custom cover failed (%v); 小红书 will fall back to a video frame", err)
+		if err := p.site.SetCover(p, t.Cover); err != nil {
+			log.Printf("note: set custom cover failed (%v); %s will fall back to a video frame", err, p.site.Name())
 		} else {
 			log.Printf("custom cover set: %s", t.Cover)
 		}
@@ -213,27 +279,7 @@ func (p *Publisher) Publish(t *task.PublishTask) error {
 		log.Println("[dry-run] form filled; NOT clicking 发布. Review the browser, then re-run with --publish.")
 		return nil
 	}
-	return p.clickPublish()
-}
-
-// selectTab switches between the 上传图文 / 上传视频 tabs.
-func (p *Publisher) selectTab(kind task.Kind) error {
-	label := "上传图文"
-	if kind == task.KindVideo {
-		label = "上传视频"
-	}
-	p.pause(500, 1300) // look at the page before choosing a tab
-	// The tab labels live in a few possible containers; match by visible text.
-	tab := p.page.Locator(fmt.Sprintf(`div:has-text("%s"), span:has-text("%s")`, label, label)).First()
-	if err := p.humanClickLocator(tab); err != nil {
-		// Image tab is usually default; only hard-fail for video.
-		if kind == task.KindVideo {
-			return fmt.Errorf("select %q tab: %w", label, err)
-		}
-		log.Printf("note: could not click %q tab (likely already active): %v", label, err)
-	}
-	p.pause(700, 1100)
-	return nil
+	return p.site.ClickPublish(p)
 }
 
 // uploadMedia feeds files to the hidden <input type=file> and waits for the
@@ -266,7 +312,7 @@ func (p *Publisher) uploadMedia(kind task.Kind, files []string) error {
 	if kind == task.KindVideo {
 		// Video transcoding can take a while. Wait until the title field is
 		// editable, which the platform only enables once upload completes.
-		if err := p.titleLocator().WaitFor(playwright.LocatorWaitForOptions{
+		if err := p.site.ReadyLocator(p).WaitFor(playwright.LocatorWaitForOptions{
 			State:   playwright.WaitForSelectorStateVisible,
 			Timeout: playwright.Float(10 * 60 * 1000), // up to 10 min
 		}); err != nil {
@@ -312,89 +358,12 @@ func (p *Publisher) cdpSetInputFiles(files []string) error {
 	return nil
 }
 
-// setCover uploads a dedicated cover image for a video note. The flow mirrors a
-// human's: 小红书 defaults to a video frame and only mounts the cover image
-// <input type=file> inside an editor modal. So we (1) click the "修改封面" entry
-// to open the cover editor (it appears only after recommended covers finish
-// loading), (2) push the image onto the modal's image input via raw CDP
-// DOM.setFileInputFiles (no 50MB cap, no native file dialog), (3) click 确定.
-// Best-effort: any step failing returns an error and the caller keeps the
-// default video-frame cover.
-func (p *Publisher) setCover(path string) error {
-	const imgInputSel = `input[type=file][accept*="image"]`
-
-	// 1. Open the cover editor. The "修改封面" entry (.operator.noCover.pointer)
-	//    only exists once recommended covers load, so poll for up to ~30s.
-	openJS := `(() => {
-		if (document.querySelector('.cover-modal ` + `input[type=file][accept*="image"]` + `')) return true;
-		const e = document.querySelector('.cover-plugin-preview .operator.noCover.pointer')
-			|| Array.from(document.querySelectorAll('div')).find(x => { const c=(x.className||'').toString(); return c.includes('noCover') && c.includes('pointer'); })
-			|| Array.from(document.querySelectorAll('div,span')).find(x => (x.innerText||'').trim() === '修改封面');
-		if (e) { e.click(); }
-		return false;
-	})()`
-	opened := false
-	for i := 0; i < 30; i++ {
-		if p.domHas(`.cover-modal ` + imgInputSel) {
-			opened = true
-			break
-		}
-		_, _ = p.page.Evaluate(openJS)
-		p.page.WaitForTimeout(1000)
-	}
-	if !opened {
-		return fmt.Errorf("cover editor did not open (recommended covers may still be loading)")
-	}
-
-	// 2. Push the image onto the modal's image input via CDP.
-	if err := p.cdpSetCoverFile(path); err != nil {
-		return err
-	}
-
-	// 3. The upload lands in the editor's image strip as a blob thumbnail;
-	//    click it so it becomes the active cover on the canvas.
-	p.page.WaitForTimeout(2500)
-	selectJS := `(() => {
-		const m = document.querySelector('.cover-modal'); if (!m) return false;
-		const img = Array.from(m.querySelectorAll('img')).find(e => (e.src||'').startsWith('blob:'));
-		if (!img) return false;
-		(img.closest('[class]') || img).click();
-		img.click();
-		return true;
-	})()`
-	if v, _ := p.page.Evaluate(selectJS); v != true {
-		return fmt.Errorf("uploaded cover thumbnail not found to select")
-	}
-
-	// 4. Confirm (确定) to apply the cover to the note.
-	p.page.WaitForTimeout(1500)
-	confirmJS := `(() => {
-		const m = document.querySelector('.cover-modal'); if (!m) return false;
-		const btn = Array.from(m.querySelectorAll('button')).find(b => (b.innerText||'').trim() === '确定');
-		if (!btn) return false; btn.click(); return true;
-	})()`
-	v, err := p.page.Evaluate(confirmJS)
-	if b, ok := v.(bool); err != nil || !ok || !b {
-		return fmt.Errorf("cover confirm (确定) not clicked (err=%v)", err)
-	}
-	p.page.WaitForTimeout(2000)
-	return nil
-}
-
-// domHas reports whether the page currently has an element matching sel.
-func (p *Publisher) domHas(sel string) bool {
-	v, err := p.page.Evaluate(`(s) => !!document.querySelector(s)`, sel)
-	if err != nil {
-		return false
-	}
-	b, _ := v.(bool)
-	return b
-}
-
-// cdpSetCoverFile sets the cover image onto the modal's image-accepting
-// <input type=file> via raw CDP DOM.setFileInputFiles. The cover editor modal
-// must already be open (see setCover).
-func (p *Publisher) cdpSetCoverFile(path string) error {
+// cdpSetCoverFile sets a cover image onto an image-accepting <input type=file>
+// via raw CDP DOM.setFileInputFiles (no 50MB cap, no native file dialog). It
+// prefers an input scoped to scopeSel (the cover editor modal, e.g.
+// ".cover-modal" on xhs or ".semi-modal" on douyin) and falls back to any
+// image input on the page. The cover editor modal must already be open.
+func (p *Publisher) cdpSetCoverFile(path, scopeSel string) error {
 	sess, err := p.page.Context().NewCDPSession(p.page)
 	if err != nil {
 		return fmt.Errorf("new cdp session: %w", err)
@@ -404,10 +373,9 @@ func (p *Publisher) cdpSetCoverFile(path string) error {
 	if _, err := sess.Send("DOM.enable", nil); err != nil {
 		return fmt.Errorf("DOM.enable: %w", err)
 	}
-	// Prefer the image input inside the cover modal; fall back to any image one.
 	res, err := sess.Send("Runtime.evaluate", map[string]interface{}{
 		"expression": `(() => {
-			const inModal = document.querySelector('.cover-modal input[type=file][accept*="image"]');
+			const inModal = document.querySelector('` + scopeSel + ` input[type=file][accept*="image"]');
 			if (inModal) return inModal;
 			const xs = Array.from(document.querySelectorAll('input[type=file]'));
 			return xs.find(e => ((e.getAttribute('accept') || '').toLowerCase().includes('image'))) || null;
@@ -429,6 +397,16 @@ func (p *Publisher) cdpSetCoverFile(path string) error {
 	return nil
 }
 
+// domHas reports whether the page currently has an element matching sel.
+func (p *Publisher) domHas(sel string) bool {
+	v, err := p.page.Evaluate(`(s) => !!document.querySelector(s)`, sel)
+	if err != nil {
+		return false
+	}
+	b, _ := v.(bool)
+	return b
+}
+
 // evalObjectID extracts result.objectId from a Runtime.evaluate CDP response.
 func evalObjectID(res interface{}) (string, error) {
 	m, ok := res.(map[string]interface{})
@@ -444,118 +422,6 @@ func evalObjectID(res interface{}) (string, error) {
 		return "", fmt.Errorf("cdp evaluate: file input not present in DOM")
 	}
 	return objectID, nil
-}
-
-func (p *Publisher) fillTitle(title string) error {
-	loc := p.titleLocator()
-	if err := loc.WaitFor(playwright.LocatorWaitForOptions{
-		State:   playwright.WaitForSelectorStateVisible,
-		Timeout: ms(p.opt.StepTimeout),
-	}); err != nil {
-		return fmt.Errorf("title field not ready: %w", err)
-	}
-	p.pause(400, 1100) // glance at the title field before typing
-	if err := p.humanTypeWithRetype(loc, title); err != nil {
-		return fmt.Errorf("type title: %w", err)
-	}
-	return nil
-}
-
-// fillContent types the body followed by hashtags. Topics are typed (not
-// pasted) so the editor's # autocomplete can bind them to real topic pages.
-func (p *Publisher) fillContent(t *task.PublishTask) error {
-	editor := p.page.Locator(`div[contenteditable="true"]`).First()
-	if err := editor.WaitFor(playwright.LocatorWaitForOptions{
-		State:   playwright.WaitForSelectorStateVisible,
-		Timeout: ms(p.opt.StepTimeout),
-	}); err != nil {
-		return fmt.Errorf("content editor not ready: %w", err)
-	}
-	if t.Content != "" {
-		if err := p.humanType(editor, t.Content); err != nil {
-			return fmt.Errorf("type content: %w", err)
-		}
-	}
-	for _, topic := range t.NormalizedTopics() {
-		p.pause(300, 900) // think before adding the next tag
-		// keep the editor focused, then type the tag at a human cadence
-		if err := p.humanType(editor, " "+topic); err != nil {
-			return fmt.Errorf("type topic %q: %w", topic, err)
-		}
-		// Wait for the # suggestion dropdown, then accept the first item.
-		p.pause(700, 1300)
-		if err := p.page.Keyboard().Press("Enter"); err != nil {
-			log.Printf("note: could not confirm topic %q via Enter: %v", topic, err)
-		}
-		p.pause(200, 500)
-	}
-	return nil
-}
-
-// clickPublish clicks the 发布 sub-button inside the <xhs-publish-btn> web
-// component. That component renders 暂存离开 / 发布 inside a CLOSED shadow root,
-// so the labels are invisible to text/role/CSS selectors (and the red is a
-// gradient, not a queryable background-color). We instead target the host
-// element — which exposes readable attributes (submit-text, submit-disabled) —
-// wait until submit-disabled="false" (video processing finished), then click
-// the right-hand (发布) pill by position.
-func (p *Publisher) clickPublish() error {
-	host := p.page.Locator("xhs-publish-btn").First()
-	if err := host.WaitFor(playwright.LocatorWaitForOptions{
-		State:   playwright.WaitForSelectorStateVisible,
-		Timeout: playwright.Float(10 * 60 * 1000),
-	}); err != nil {
-		return fmt.Errorf("publish component <xhs-publish-btn> not found: %w", err)
-	}
-	if err := host.ScrollIntoViewIfNeeded(); err != nil {
-		log.Printf("note: scroll publish button into view: %v", err)
-	}
-	if err := p.waitPublishEnabled(6 * time.Minute); err != nil {
-		return err
-	}
-
-	box, err := host.BoundingBox()
-	if err != nil || box == nil {
-		return fmt.Errorf("publish component has no bounding box: %w", err)
-	}
-	// 暂存离开 sits on the left of the component, 发布 on the right (~0.61 across).
-	cx := box.X + box.Width*0.61 + p.jitter(box.Width*0.03)
-	cy := box.Y + box.Height*0.5 + p.jitter(box.Height*0.18)
-	p.readPage()       // skim the finished post before committing
-	p.pause(500, 1400) // a beat of hesitation before committing
-	if err := p.humanClickXY(cx, cy); err != nil {
-		return fmt.Errorf("click 发布: %w", err)
-	}
-	// A successful publish navigates away from the form (to the note list).
-	p.page.WaitForTimeout(5000)
-	log.Printf("publish clicked; current URL: %s", p.page.URL())
-	return nil
-}
-
-// waitPublishEnabled polls the component's submit-disabled attribute until the
-// platform finishes processing the video and enables 发布.
-func (p *Publisher) waitPublishEnabled(timeout time.Duration) error {
-	const step = 2 * time.Second
-	for waited := time.Duration(0); waited < timeout; waited += step {
-		v, err := p.page.Evaluate(`() => {
-			const e = document.querySelector('xhs-publish-btn');
-			return e ? e.getAttribute('submit-disabled') : null;
-		}`)
-		if s, ok := v.(string); ok && s == "false" {
-			return nil
-		} else if err != nil {
-			log.Printf("note: polling submit-disabled: %v", err)
-		}
-		log.Printf("waiting for 发布 to enable (video processing)... %s", waited)
-		p.page.WaitForTimeout(float64(step.Milliseconds()))
-	}
-	return fmt.Errorf("发布 still disabled after %s — video may still be processing", timeout)
-}
-
-// titleLocator matches the title <input> by its placeholder text, falling back
-// to any non-file text input on the form.
-func (p *Publisher) titleLocator() playwright.Locator {
-	return p.page.Locator(`input[placeholder*="标题"], input[type="text"]:not([type="file"])`).First()
 }
 
 func ms(d time.Duration) *float64 { return playwright.Float(float64(d.Milliseconds())) }

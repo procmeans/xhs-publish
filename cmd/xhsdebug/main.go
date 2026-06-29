@@ -37,9 +37,18 @@ func main() {
 	ctx := browser.Contexts()[0]
 	pages := ctx.Pages()
 	var page playwright.Page
+	// Prefer a compose/upload tab on either platform (小红书 publish, 抖音 upload).
+	// When several match, prefer one whose title field is already filled (the
+	// form the publisher actually drove) over an empty upload landing page.
 	for _, p := range pages {
-		if u := p.URL(); contains(u, "publish") {
-			page = p
+		u := p.URL()
+		if !(contains(u, "publish") || contains(u, "upload") || contains(u, "creator.douyin")) {
+			continue
+		}
+		page = p
+		v, _ := p.Evaluate(`(() => { const e = document.querySelector('input[placeholder*="标题"], input[type=text]'); return e && (e.value||'').trim().length > 0; })()`)
+		if filled, _ := v.(bool); filled {
+			break
 		}
 	}
 	if page == nil && len(pages) > 0 {
@@ -126,7 +135,23 @@ func main() {
 		}
 		const seen = new Set();
 		const cov = coverEls.filter(e => { const k = e.text+e.rect.x+e.rect.y; if(seen.has(k))return false; seen.add(k); return true; });
-		return { fileInputs, coverEls: cov };
+		// Title inputs (by placeholder) — find the 标题 field on either platform.
+		const titleInputs = Array.from(document.querySelectorAll('input')).filter(el => {
+			const ph = el.getAttribute('placeholder') || '';
+			return el.type !== 'file' && (ph.includes('标题') || el.type === 'text');
+		}).map(el => ({ placeholder: el.getAttribute('placeholder')||'', cls:(el.className||'').toString().slice(0,70), rect: rect(el) }));
+		// Publish-button candidates (发布 / 存草稿 / 暂存) across buttons & web components.
+		const PB = ['发布','存草稿','暂存离开','暂存','下一步','完成'];
+		const publishButtons = [];
+		for (const el of document.querySelectorAll('button,[role="button"],xhs-publish-btn')) {
+			const t = (el.innerText||el.textContent||'').trim();
+			const r = el.getBoundingClientRect();
+			if (r.width === 0 && r.height === 0) continue;
+			if (el.tagName.toLowerCase() === 'xhs-publish-btn' || PB.some(k => t === k)) {
+				publishButtons.push({ tag: el.tagName.toLowerCase(), text: t.slice(0,12), disabled: el.disabled || el.getAttribute('aria-disabled')==='true' || el.getAttribute('submit-disabled'), cls:(el.className||'').toString().slice(0,60), rect: rect(el) });
+			}
+		}
+		return { fileInputs, coverEls: cov, titleInputs, publishButtons };
 	}`)
 	if err != nil {
 		log.Fatal(err)

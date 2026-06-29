@@ -19,12 +19,28 @@ const (
 	KindVideo Kind = "video" // 视频笔记
 )
 
-// Limits imposed by the Xiaohongshu creator platform.
-const (
-	MaxTitleRunes   = 20
-	MaxContentRunes = 1000
-	MaxImages       = 18
+// Limits are the per-platform caps the creator platform enforces on a note.
+type Limits struct {
+	Title   int // max title runes
+	Content int // max body runes
+	Images  int // max images per image note
+}
+
+// Platform limits. Xiaohongshu caps titles at 20 runes; Douyin allows 30.
+var (
+	xhsLimits    = Limits{Title: 20, Content: 1000, Images: 18}
+	douyinLimits = Limits{Title: 30, Content: 1000, Images: 35}
 )
+
+// LimitsFor returns the caps for a platform key ("xhs" default, "douyin").
+func LimitsFor(platform string) Limits {
+	switch strings.ToLower(strings.TrimSpace(platform)) {
+	case "douyin", "dy", "抖音":
+		return douyinLimits
+	default:
+		return xhsLimits
+	}
+}
 
 // PublishTask is one note to publish. It is the single contract between the
 // content source (manual JSON or a generator) and the publisher.
@@ -36,10 +52,18 @@ type PublishTask struct {
 	Video   string   `json:"video,omitempty"`   // absolute video path (video notes)
 	Cover   string   `json:"cover,omitempty"`   // optional cover image for video notes
 	Topics  []string `json:"topics,omitempty"`  // hashtags, with or without leading '#'
+
+	// AIGenerated, when true, declares the content as AI-generated where the
+	// platform supports it (抖音 自主声明 → 内容由AI生成).
+	AIGenerated bool `json:"ai_generated,omitempty"`
 }
 
-// Load reads and validates a task from a JSON file.
-func Load(path string) (*PublishTask, error) {
+// Load reads and validates a task from a JSON file against Xiaohongshu limits.
+// Use LoadFor to validate against a specific platform's limits.
+func Load(path string) (*PublishTask, error) { return LoadFor(path, "xhs") }
+
+// LoadFor reads a task and validates it against the given platform's limits.
+func LoadFor(path, platform string) (*PublishTask, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read task file: %w", err)
@@ -55,22 +79,27 @@ func Load(path string) (*PublishTask, error) {
 			t.Kind = KindImage
 		}
 	}
-	if err := t.Validate(); err != nil {
+	if err := t.ValidateWith(LimitsFor(platform)); err != nil {
 		return nil, err
 	}
 	return &t, nil
 }
 
-// Validate checks the task against platform limits and that media files exist.
-func (t *PublishTask) Validate() error {
+// Validate checks the task against Xiaohongshu limits and that media files
+// exist. Prefer ValidateWith to target a specific platform.
+func (t *PublishTask) Validate() error { return t.ValidateWith(xhsLimits) }
+
+// ValidateWith checks the task against the given platform limits and that media
+// files exist.
+func (t *PublishTask) ValidateWith(lim Limits) error {
 	if strings.TrimSpace(t.Title) == "" {
 		return fmt.Errorf("title is required")
 	}
-	if n := utf8.RuneCountInString(t.Title); n > MaxTitleRunes {
-		return fmt.Errorf("title is %d chars, exceeds limit of %d", n, MaxTitleRunes)
+	if n := utf8.RuneCountInString(t.Title); n > lim.Title {
+		return fmt.Errorf("title is %d chars, exceeds limit of %d", n, lim.Title)
 	}
-	if n := utf8.RuneCountInString(t.Content); n > MaxContentRunes {
-		return fmt.Errorf("content is %d chars, exceeds limit of %d", n, MaxContentRunes)
+	if n := utf8.RuneCountInString(t.Content); n > lim.Content {
+		return fmt.Errorf("content is %d chars, exceeds limit of %d", n, lim.Content)
 	}
 
 	switch t.Kind {
@@ -78,8 +107,8 @@ func (t *PublishTask) Validate() error {
 		if len(t.Images) == 0 {
 			return fmt.Errorf("image note requires at least one image")
 		}
-		if len(t.Images) > MaxImages {
-			return fmt.Errorf("image note has %d images, exceeds limit of %d", len(t.Images), MaxImages)
+		if len(t.Images) > lim.Images {
+			return fmt.Errorf("image note has %d images, exceeds limit of %d", len(t.Images), lim.Images)
 		}
 		for _, p := range t.Images {
 			if err := mustExist(p); err != nil {
