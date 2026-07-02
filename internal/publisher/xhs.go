@@ -28,24 +28,116 @@ func (xhsSite) LoggedOut(currentURL string) bool {
 
 func (xhsSite) ReadyLocator(p *Publisher) playwright.Locator { return xhsTitleLocator(p) }
 
-// SelectTab switches between the 上传图文 / 上传视频 tabs.
+// SelectTab switches to the 上传图文 / 上传视频 tab.
+//
+// The composer defaults to whichever tab the account last used (some accounts
+// land on 上传视频). We must positively land on the right one, because uploadMedia
+// feeds files to the first <input type=file> on the page — the WRONG tab's input
+// would silently swallow the file and the editor would never appear. So we click
+// the tab by its exact-text position (real mouse move, for stealth) and VERIFY
+// the switch via the file input's accept type, retrying before giving up.
 func (xhsSite) SelectTab(p *Publisher, kind task.Kind) error {
 	label := "上传图文"
+	wantImage := true
 	if kind == task.KindVideo {
-		label = "上传视频"
+		label, wantImage = "上传视频", false
 	}
 	p.pause(500, 1300) // look at the page before choosing a tab
-	// The tab labels live in a few possible containers; match by visible text.
-	tab := p.page.Locator(fmt.Sprintf(`div:has-text("%s"), span:has-text("%s")`, label, label)).First()
-	if err := p.humanClickLocator(tab); err != nil {
-		// Image tab is usually default; only hard-fail for video.
-		if kind == task.KindVideo {
-			return fmt.Errorf("select %q tab: %w", label, err)
-		}
-		log.Printf("note: could not click %q tab (likely already active): %v", label, err)
+
+	if xhsOnTab(p, wantImage) {
+		p.pause(300, 700)
+		return nil // already on the right tab
 	}
-	p.pause(700, 1100)
-	return nil
+	for i := 0; i < 15; i++ {
+		if err := xhsClickTab(p, label); err != nil {
+			log.Printf("note: click %q tab (attempt %d): %v", label, i+1, err)
+		}
+		p.page.WaitForTimeout(p.randMs(700, 1100))
+		if xhsOnTab(p, wantImage) {
+			p.pause(300, 700)
+			return nil
+		}
+	}
+	return fmt.Errorf("could not switch to the %q tab (composer stayed on the other uploader)", label)
+}
+
+// xhsOnTab reports whether the composer is currently on the image (or video)
+// uploader, judged by the accept type of the page's file input.
+func xhsOnTab(p *Publisher, wantImage bool) bool {
+	v, err := p.page.Evaluate(`() => {
+		const e = document.querySelector('input[type=file]');
+		return e ? (e.getAttribute('accept') || '').toLowerCase() : '';
+	}`)
+	if err != nil {
+		return false
+	}
+	acc, _ := v.(string)
+	isImage := strings.Contains(acc, "image") || strings.Contains(acc, ".jpg") || strings.Contains(acc, ".png") || strings.Contains(acc, ".webp")
+	isVideo := strings.Contains(acc, "video") || strings.Contains(acc, ".mp4") || strings.Contains(acc, ".mov")
+	if wantImage {
+		return isImage && !isVideo
+	}
+	return isVideo && !isImage
+}
+
+// asFloat coerces a value pulled out of a Playwright Evaluate result to float64.
+// Playwright-go decodes integer-valued JS numbers as int (getBoundingClientRect
+// can return whole CSS pixels), so a plain v.(float64) assertion would fail and
+// silently yield 0 — which is exactly the bug that made tab clicks land at (0,0).
+func asFloat(v interface{}) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case float32:
+		return float64(n)
+	case int:
+		return float64(n)
+	case int64:
+		return float64(n)
+	case int32:
+		return float64(n)
+	}
+	return 0
+}
+
+// xhsClickTab locates the tab whose exact trimmed text is label (the topmost,
+// smallest leaf element — i.e. the real tab, not an ancestor container) and
+// clicks its center with a human mouse move. Falls back to a JS click if the
+// element can't be measured.
+func xhsClickTab(p *Publisher, label string) error {
+	// Visibility is judged by the on-screen rect (getBoundingClientRect), NOT
+	// offsetParent — the tab bar is position:fixed/sticky, whose offsetParent is
+	// null even while fully visible, which would wrongly exclude the real tab.
+	v, err := p.page.Evaluate(`(lbl) => {
+		const vis = e => { const r = e.getBoundingClientRect();
+			return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < (window.innerHeight || 900); };
+		const els = Array.from(document.querySelectorAll('div,span,button,a'))
+			.filter(e => e.children.length === 0 && (e.textContent || '').trim() === lbl && vis(e));
+		if (!els.length) return null;
+		els.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+		const r = els[0].getBoundingClientRect();
+		return { x: r.x, y: r.y, w: r.width, h: r.height };
+	}`, label)
+	if err != nil {
+		return err
+	}
+	m, ok := v.(map[string]interface{})
+	if !ok {
+		// fall back to a direct JS click on the same element
+		_, _ = p.page.Evaluate(`(lbl) => {
+			const vis = e => { const r = e.getBoundingClientRect();
+				return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < (window.innerHeight || 900); };
+			const t = Array.from(document.querySelectorAll('div,span,button,a'))
+				.find(e => e.children.length === 0 && (e.textContent || '').trim() === lbl && vis(e));
+			if (t) (t.closest('[class]') || t).click();
+		}`, label)
+		return fmt.Errorf("tab %q not found for mouse click; used JS fallback", label)
+	}
+	x, y, w, h := asFloat(m["x"]), asFloat(m["y"]), asFloat(m["w"]), asFloat(m["h"])
+	if w <= 0 || h <= 0 {
+		return fmt.Errorf("tab %q has a zero-size rect", label)
+	}
+	return p.humanClickXY(x+w*0.5+p.jitter(w*0.15), y+h*0.5+p.jitter(h*0.2))
 }
 
 func (xhsSite) FillTitle(p *Publisher, title string) error {
