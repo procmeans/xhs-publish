@@ -144,6 +144,8 @@ type Publisher struct {
 	profile      HumanProfile // tunables for the humanization behavior
 	rng          *rand.Rand   // randomness for pauses/jitter/typos
 	lastX, lastY float64      // tracked cursor position for mouse paths
+
+	imeSess playwright.CDPSession // persistent CDP session for IME-style CJK input
 }
 
 // New attaches to the Chrome instance exposed on opt.CDPEndpoint.
@@ -216,6 +218,9 @@ func New(opt Options) (*Publisher, error) {
 
 // Close detaches from Chrome. It does NOT close the user's browser.
 func (p *Publisher) Close() {
+	if p.imeSess != nil {
+		_ = p.imeSess.Detach()
+	}
 	if p.browser != nil {
 		_ = p.browser.Close() // detaches the CDP connection only
 	}
@@ -393,6 +398,55 @@ func (p *Publisher) cdpSetCoverFile(path, scopeSel string) error {
 		"objectId": objectID,
 	}); err != nil {
 		return fmt.Errorf("DOM.setFileInputFiles(cover): %w", err)
+	}
+	return nil
+}
+
+// imeSession lazily opens (and caches) a CDP session on the current page for
+// dispatching IME composition events. It is detached in Close.
+func (p *Publisher) imeSession() (playwright.CDPSession, error) {
+	if p.imeSess != nil {
+		return p.imeSess, nil
+	}
+	s, err := p.page.Context().NewCDPSession(p.page)
+	if err != nil {
+		return nil, fmt.Errorf("new cdp session for ime: %w", err)
+	}
+	p.imeSess = s
+	return s, nil
+}
+
+// cdpIMEType commits one non-ASCII character (Chinese, emoji, …) into the
+// focused editable as if it were confirmed from a real IME.
+//
+// Keyboard.InsertText inserts text with a single bare `input` event and NO
+// composition events — indistinguishable from a paste, and the one behavioral
+// tell that survives on 小红书 (whose notes are almost entirely 中文). Instead we
+// drive the CDP Input domain directly: imeSetComposition fires a genuine
+// compositionstart+compositionupdate, then insertText commits it with
+// compositionend+input. The browser itself dispatches these, so isTrusted is
+// true and the full event sequence matches a person typing over an IME.
+func (p *Publisher) cdpIMEType(r rune) error {
+	sess, err := p.imeSession()
+	if err != nil {
+		return err
+	}
+	s := string(r)
+	n := 1 // caret after the composed text, in UTF-16 code units
+	if r > 0xFFFF {
+		n = 2 // astral chars (emoji) are a surrogate pair
+	}
+	if _, err := sess.Send("Input.imeSetComposition", map[string]interface{}{
+		"text":           s,
+		"selectionStart": n,
+		"selectionEnd":   n,
+	}); err != nil {
+		return fmt.Errorf("ime set composition %q: %w", s, err)
+	}
+	if _, err := sess.Send("Input.insertText", map[string]interface{}{
+		"text": s,
+	}); err != nil {
+		return fmt.Errorf("ime commit %q: %w", s, err)
 	}
 	return nil
 }

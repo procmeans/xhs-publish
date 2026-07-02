@@ -109,10 +109,9 @@ func (xhsSite) FillContent(p *Publisher, t *task.PublishTask) error {
 				}); err != nil {
 					return fmt.Errorf("type topic %q: %w", topic, err)
 				}
-			} else {
-				if err := kb.InsertText(string(r)); err != nil {
-					return fmt.Errorf("type topic %q: %w", topic, err)
-				}
+			} else if err := p.cdpIMEType(r); err != nil {
+				// CJK topic char via real IME composition, not a bare InsertText.
+				return fmt.Errorf("type topic %q: %w", topic, err)
 			}
 			p.page.WaitForTimeout(p.randMs(40, 120))
 		}

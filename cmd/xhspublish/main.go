@@ -13,6 +13,7 @@ package main
 import (
 	"flag"
 	"log"
+	"math/rand"
 	"os"
 	"time"
 
@@ -34,6 +35,7 @@ func main() {
 		caution   = flag.Float64("caution", 1.0, "multiplier on thinking pauses & hesitation")
 		noFatigue = flag.Bool("no-fatigue", false, "disable the warm-up/fatigue typing curve")
 		timeout   = flag.Duration("timeout", 60*time.Second, "per-step timeout")
+		jitter    = flag.Duration("jitter", 0, "before a real 发布, wait a random 0–jitter delay so scheduled runs don't post on a fixed clock (e.g. 20m; ignored in dry-run)")
 	)
 	flag.Parse()
 
@@ -61,6 +63,15 @@ func main() {
 		Fatigue:     !*noFatigue,
 	}
 	opt.StepTimeout = *timeout
+
+	// Schedule jitter: when actually publishing, wait a random 0–jitter beat so a
+	// fixed-schedule caller (cron, a skill firing on the hour) doesn't post at the
+	// same wall-clock time every day. Skipped in dry-run so review stays instant.
+	if !opt.DryRun && *jitter > 0 {
+		d := time.Duration(rand.Int63n(int64(*jitter) + 1))
+		log.Printf("jitter: waiting %s before publishing (spreads scheduled posts off a fixed clock)", d.Round(time.Second))
+		time.Sleep(d)
+	}
 
 	// We attach to the user's REAL, visible Chrome over CDP — never headless.
 	log.Printf("attaching to real Chrome at %s (not headless); humanize=%v", *cdp, opt.Humanize)

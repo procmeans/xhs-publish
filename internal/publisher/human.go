@@ -15,11 +15,13 @@ import (
 //   - mouse paths that curve, ease, overshoot-and-correct, and drift while idle
 //   - clicks with a real mousedown→mouseup dwell (and the odd micro-slip)
 //   - typing that fires genuine key events for latin text (not just `input`),
-//     types Chinese over InsertText, varies cadence in autocorrelated bursts,
+//     commits Chinese through a real IME composition (compositionstart→end, not
+//     a bare paste-like InsertText), varies cadence in autocorrelated bursts,
 //     and fumbles characters with plausible (adjacent-key / double / delayed)
 //     typos that get corrected
 //   - inertial wheel scrolling and a "read the page" glance before committing
-//   - a stealth pass that neutralises the obvious navigator.webdriver tell
+//   - a stealth pass that neutralises navigator.webdriver, the CDP Runtime.enable
+//     console/Error.stack probe, and the Function.prototype.toString patch leak
 //
 // All of this runs against the user's REAL, visible Chrome (attached over CDP)
 // — never a headless browser — which is itself the single biggest anti-detection
@@ -220,7 +222,8 @@ func (p *Publisher) humanClickXY(x, y float64) error {
 // isTypeable reports whether a rune can be sent as a genuine physical keypress
 // (printable ASCII). Such characters go through Keyboard.Press so the page sees
 // keydown/keypress/keyup, not just an `input` event. Everything else (CJK,
-// emoji, newlines) goes through InsertText.
+// emoji) is committed via a real IME composition (cdpIMEType); a newline still
+// goes through InsertText.
 func isTypeable(r rune) bool {
 	return r >= 0x20 && r < 0x7f
 }
@@ -270,7 +273,7 @@ func (p *Publisher) typingScale(i, n int) float64 {
 }
 
 // humanType focuses loc and types text at a human cadence: real key events for
-// latin, InsertText for Chinese, autocorrelated inter-key delays (bursts and
+// latin, IME composition for Chinese, autocorrelated inter-key delays (bursts and
 // stalls rather than a fixed beat), longer think-pauses at sentence boundaries,
 // and occasional typos — some fixed immediately, some only noticed a character
 // or two later.
@@ -296,8 +299,12 @@ func (p *Publisher) humanType(loc playwright.Locator, text string) error {
 			ferr = kb.Press(string(r), playwright.KeyboardPressOptions{
 				Delay: playwright.Float(p.randMs(35, 110) / p.profile.SpeedFactor), // keydown→keyup hold
 			})
+		} else if r == '\n' {
+			ferr = kb.InsertText("\n") // a newline isn't an IME-composed glyph
 		} else {
-			ferr = kb.InsertText(string(r))
+			// CJK/emoji: commit through a real IME composition (isTrusted, with
+			// compositionstart/update/end) instead of a bare InsertText paste.
+			ferr = p.cdpIMEType(r)
 		}
 	}
 	press := func(key string) {
@@ -433,24 +440,103 @@ func (p *Publisher) readPage() {
 	p.pause(300, 800)
 }
 
-// stealthInit neutralises the most common automation tell (navigator.webdriver)
-// for any page that loads after it is installed.
-const stealthInit = `try{Object.defineProperty(navigator,'webdriver',{get:()=>false,configurable:true});}catch(e){}`
+// stealthInit closes the automation tells that CDP control can open on an
+// otherwise-genuine Chrome profile. It runs as an init script (so it applies to
+// every page/frame before the site's own JS) and is idempotent. It covers:
+//
+//   - navigator.webdriver — forced to false (a real, non-automated Chrome
+//     reports false, not undefined).
+//   - the Runtime.enable console probe — the headline CDP tell. With a debugger
+//     client attached, Chrome eagerly serialises objects passed to console.*
+//     methods, which fires any getter a detector planted on Error.prototype.stack
+//     (or on an Error instance's .stack). The canonical check is roughly:
+//         const e=new Error(); Object.defineProperty(e,'stack',{get(){hit=true}});
+//         console.debug(e);            // hit === true  ⟺  CDP attached
+//     We replace the console methods with no-ops so the detector's own console
+//     call never hands its argument to the native serialiser — the getter can't
+//     fire. (We log from the Go side, not the page, so nothing of ours is lost.)
+//   - the Function.prototype.toString leak — every override above would otherwise
+//     be exposed by `fn.toString()` returning our source instead of
+//     "[native code]". We patch toString to report native code for the functions
+//     we installed (tracked in a WeakSet), and mark the patch itself native.
+//
+// This is the primary CDP tell, not an exhaustive list: a determined detector
+// still has other vectors (attach timing, navigation cadence, account signals).
+const stealthInit = `(() => {
+  try {
+    // toString leak guard: functions registered here report as native code.
+    var NATIVE = new WeakSet();
+    var realToString = Function.prototype.toString;
+    var patchedToString = function toString() {
+      if (NATIVE.has(this)) return "function " + (this.name || "") + "() { [native code] }";
+      return realToString.call(this);
+    };
+    NATIVE.add(patchedToString);
+    Object.defineProperty(Function.prototype, "toString", {
+      value: patchedToString, configurable: true, writable: true,
+    });
+    var asNative = function (fn, name) {
+      if (name) { try { Object.defineProperty(fn, "name", { value: name, configurable: true }); } catch (e) {} }
+      NATIVE.add(fn);
+      return fn;
+    };
 
-// HardenStealth installs the stealth patch for future navigations and applies it
-// to the page that's already open, then logs the observed webdriver flag so a
-// leak is visible. Attaching to a real Chrome profile already gives a genuine
-// fingerprint; this just closes the one gap CDP control can open.
+    // navigator.webdriver -> false, defined on the prototype like the real one.
+    try {
+      Object.defineProperty(Navigator.prototype, "webdriver", {
+        get: asNative(function () { return false; }, "get webdriver"),
+        configurable: true, enumerable: true,
+      });
+    } catch (e) {}
+
+    // Neutralise the Runtime.enable console/Error.stack serialisation probe.
+    var c = window.console;
+    if (c) {
+      ["log","debug","info","warn","error","assert","dir","dirxml","table",
+       "trace","group","groupCollapsed","count","timeStamp","timeEnd","timeLog",
+       "profile","profileEnd"
+      ].forEach(function (m) {
+        if (typeof c[m] !== "function") return;
+        try {
+          Object.defineProperty(c, m, {
+            value: asNative(function () {}, m), configurable: true, writable: true,
+          });
+        } catch (e) {}
+      });
+    }
+  } catch (e) {}
+})();`
+
+// HardenStealth installs stealthInit for every future navigation/frame and
+// applies it to the already-open page, then runs a self-test probe (the same
+// Error.stack-via-console check a detector would use) and logs the result so any
+// residual leak is visible. Attaching to a real Chrome profile already gives a
+// genuine fingerprint; this closes the gaps CDP control opens on top of it.
 func (p *Publisher) HardenStealth() {
 	if err := p.page.AddInitScript(playwright.Script{Content: playwright.String(stealthInit)}); err != nil {
 		log.Printf("note: add stealth init script: %v", err)
 	}
-	v, err := p.page.Evaluate(`(() => { ` + stealthInit + ` return navigator.webdriver; })()`)
-	if err != nil {
+	// Apply to the current page (init scripts only fire on future navigations).
+	if _, err := p.page.Evaluate(stealthInit); err != nil {
 		log.Printf("note: apply stealth to current page: %v", err)
 		return
 	}
-	log.Printf("stealth: navigator.webdriver = %v", v)
+	// Self-test: after hardening, the CDP console probe must NOT fire the getter.
+	probe := `(() => {
+		try {
+			var fired = false;
+			var e = new Error();
+			Object.defineProperty(e, "stack", { get: function () { fired = true; return ""; }, configurable: true });
+			console.debug(e);
+			return { webdriver: navigator.webdriver, cdpConsoleProbeFired: fired };
+		} catch (err) { return { error: String(err) }; }
+	})()`
+	v, err := p.page.Evaluate(probe)
+	if err != nil {
+		log.Printf("note: stealth self-test: %v", err)
+		return
+	}
+	log.Printf("stealth self-test: %v", v)
 }
 
 func isBoundary(r rune) bool {
